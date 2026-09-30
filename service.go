@@ -459,6 +459,13 @@ func (s *Service) buildSwapRequest(rotations []Rotation) (*SwapRequest, error) {
 		if n := len(participantSet); n < 2 || n > 4 {
 			problems = append(problems, fmt.Sprintf("a swap must involve 2 to 4 distinct employees, got %d", n))
 		}
+		// 每名参与者交出一个班次、恰好接一个班次：轮换条数必须等于参与人数，
+		// 且新持有人集合与当前持有人集合一致、每人交出/接手数量相同。
+		// 否则像“2 人之间重分配 4 个班次”这类非循环重排会被错误放行。
+		if len(rotations) != len(participantSet) {
+			problems = append(problems,
+				"each participant must give up exactly one shift and take exactly one")
+		}
 		// 轮换必须在参与者集合内部闭环：每个参与者交出一个班次、接一个班次。
 		if len(newHolders) != len(participantSet) {
 			problems = append(problems, "rotations must form a closed cycle among the current holders")

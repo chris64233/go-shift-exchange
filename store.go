@@ -2,6 +2,7 @@ package goshiftexchange
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -62,7 +63,59 @@ func NewFileStore(path string) (*FileStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("goshiftexchange: open event log: %w", err)
 	}
-	return &FileStore{f: f}, nil
+	s := &FileStore{f: f}
+	if err := s.recoverTornTail(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// recoverTornTail 截断文件末尾不带换行符的不完整行（追加到一半掉电留下的半行）。
+// 以换行结尾的完整事件一律保留；整个文件都没有换行时视为全是半行，清空重来。
+func (s *FileStore) recoverTornTail() error {
+	fi, err := s.f.Stat()
+	if err != nil {
+		return fmt.Errorf("goshiftexchange: stat event log: %w", err)
+	}
+	size := fi.Size()
+	if size == 0 {
+		return nil
+	}
+	// 半行必在文件末尾。从后往前分块扫描最后一个换行：JSON 事件单行编码，
+	// 换行只会出现在两行之间，因此最后一个换行之后的全部内容就是半行。
+	const chunk = 64 * 1024
+	var cut int64 = -1
+	for end := size; end > 0; {
+		start := end - chunk
+		if start < 0 {
+			start = 0
+		}
+		buf := make([]byte, end-start)
+		n, err := s.f.ReadAt(buf, start)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("goshiftexchange: read event log tail: %w", err)
+		}
+		buf = buf[:n]
+		if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
+			cut = start + int64(i) + 1
+			break
+		}
+		end = start
+	}
+	if cut == size {
+		return nil // 最后一个换行恰好在末尾：末行完整，无需恢复。
+	}
+	if cut < 0 {
+		cut = 0 // 整个文件都没有换行：全部视为半行。
+	}
+	if err := s.f.Truncate(cut); err != nil {
+		return fmt.Errorf("goshiftexchange: truncate torn event tail: %w", err)
+	}
+	if _, err := s.f.Seek(cut, io.SeekStart); err != nil {
+		return fmt.Errorf("goshiftexchange: seek event log: %w", err)
+	}
+	return nil
 }
 
 // Close 关闭底层文件。
@@ -78,6 +131,22 @@ func (s *FileStore) Append(events []Event) error {
 	defer s.mu.Unlock()
 
 	bw := bufio.NewWriter(s.f)
+	// 旧版本文件或手工编辑后可能缺少末尾换行，先补齐，避免新事件粘在上一行后。
+	fi, err := s.f.Stat()
+	if err != nil {
+		return fmt.Errorf("goshiftexchange: stat event log: %w", err)
+	}
+	if fi.Size() > 0 {
+		tail := make([]byte, 1)
+		if _, err := s.f.ReadAt(tail, fi.Size()-1); err != nil {
+			return fmt.Errorf("goshiftexchange: read event log tail: %w", err)
+		}
+		if tail[0] != '\n' {
+			if _, err := bw.WriteString("\n"); err != nil {
+				return fmt.Errorf("goshiftexchange: separate event line: %w", err)
+			}
+		}
+	}
 	enc := json.NewEncoder(bw)
 	for i := range events {
 		if err := enc.Encode(&events[i]); err != nil {
