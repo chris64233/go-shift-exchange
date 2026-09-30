@@ -53,7 +53,8 @@
 ```
 
 参与者集合由轮换班次的**当前持有人**自动确定，轮换必须在持有人之间构成闭环：
-每名参与者交出一个班次、恰好接一个班次；申请人数（即不同持有人数）必须为 2~4。
+每名参与者交出与接收的班次数量相等（一名参与者可以在同一份申请中交出并接收
+多个班次，轮换总数为 2~4 条）；申请人数（即不同持有人数）必须为 2~4。
 
 ## API 速览
 
@@ -66,7 +67,7 @@ svc.AddQualification(employeeID string, positions ...string) error
 svc.GetEmployee(id string) (*Employee, error)
 svc.ListEmployees() []Employee
 
-// 班次安排（立即按完整排班校验）
+// 班次安排（要求起止时间齐全且 end > start，并立即按完整排班校验）
 svc.ScheduleShift(Shift{ID, Position, Start, End, EmployeeID}) (*Shift, error)
 svc.GetShift(id string) (*Shift, error)
 svc.ListShifts() []Shift
@@ -150,7 +151,8 @@ go test -cover ./...     # 覆盖率（当前约 87%）
 go test -run Example ./...
 ```
 
-测试覆盖：2/3/4 人轮换一次性生效、换班后整体校验（资质、交换诱导的重叠与休息
-不足）、拒绝/撤回终态、重复同意与重复拒绝的幂等、版本冲突失败且不覆盖新排班、
-“收齐时才变得不合法”的失败路径、最后同意与撤回/拒绝的并发竞争（多轮 + race）、
-JSONL 持久化与重放、历史查询。
+测试覆盖：2/3/4 人轮换一次性生效（含一名参与者交出/接收多个班次的 2~4 条轮换）、
+换班后整体校验（资质、交换诱导的重叠与休息不足）、拒绝/撤回终态、重复同意与重复
+拒绝的幂等、版本冲突失败且不覆盖新排班、“收齐时才变得不合法”的失败路径、最后
+同意与撤回/拒绝的并发竞争（多轮 + race）、JSONL 持久化与重放（含 pending 申请
+重启后继续收齐同意并原子生效）、历史查询。

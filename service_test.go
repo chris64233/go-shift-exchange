@@ -308,6 +308,109 @@ func TestSwap_ThreeAndFourPeople(t *testing.T) {
 	}
 }
 
+// TestSwap_MultiShiftPerParticipant 覆盖“一名参与者在同一份申请中交出并接收
+// 多个班次”的轮换：2 名参与者、4 条轮换（每人交 2 接 2），以及 3 名参与者、
+// 4 条轮换（其中一人交 2 接 2）。整环仍须一次性原子生效。
+func TestSwap_MultiShiftPerParticipant(t *testing.T) {
+	// 两人各交 2 接 2：alice{a1,a2} <-> carol{c1,c2}。
+	svc, err := NewService(NewMemoryStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"alice", "carol"} {
+		if _, err := svc.RegisterEmployee(id, id, []string{"A"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must := func(id, emp string, day int) {
+		t.Helper()
+		if _, err := svc.ScheduleShift(Shift{
+			ID: id, Position: "A", EmployeeID: emp,
+			Start: dayTime(day, 8, 0), End: dayTime(day, 16, 0),
+		}); err != nil {
+			t.Fatalf("schedule %s: %v", id, err)
+		}
+	}
+	must("a1", "alice", 1)
+	must("a2", "alice", 2)
+	must("c1", "carol", 3)
+	must("c2", "carol", 4)
+
+	req, err := svc.CreateSwapRequest([]Rotation{
+		{"a1", "carol"}, {"a2", "carol"}, {"c1", "alice"}, {"c2", "alice"},
+	})
+	if err != nil {
+		t.Fatalf("create 2x2: %v", err)
+	}
+	if len(req.Participants) != 2 || len(req.Rotations) != 4 {
+		t.Fatalf("participants=%v rotations=%d, want 2 participants / 4 rotations",
+			req.Participants, len(req.Rotations))
+	}
+	for _, emp := range []string{"alice", "carol"} {
+		if _, err := svc.Agree(req.ID, emp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := svc.GetSwapRequest(req.ID)
+	if got.Status != SwapCompleted {
+		t.Fatalf("2x2 status = %s (%s)", got.Status, got.FailReason)
+	}
+	for id, want := range map[string]string{
+		"a1": "carol", "a2": "carol", "c1": "alice", "c2": "alice",
+	} {
+		if sh, _ := svc.GetShift(id); sh.EmployeeID != want || sh.Version != 2 {
+			t.Fatalf("%s = %s v%d, want %s v2", id, sh.EmployeeID, sh.Version, want)
+		}
+	}
+
+	// 三人 4 条轮换：alice 交 a3、a4 接 b1、c3；bob 交 b1 接 a3；carol 交 c3 接 a4。
+	must("a3", "alice", 5)
+	must("a4", "alice", 6)
+	if _, err := svc.RegisterEmployee("bob", "bob", []string{"A"}); err != nil {
+		t.Fatal(err)
+	}
+	must("b1", "bob", 7)
+	must("c3", "carol", 8)
+
+	req3, err := svc.CreateSwapRequest([]Rotation{
+		{"a3", "bob"}, {"b1", "alice"}, {"a4", "carol"}, {"c3", "alice"},
+	})
+	if err != nil {
+		t.Fatalf("create 3-way 4-rotation: %v", err)
+	}
+	if len(req3.Participants) != 3 {
+		t.Fatalf("participants = %v, want 3", req3.Participants)
+	}
+	for _, emp := range []string{"alice", "bob", "carol"} {
+		if _, err := svc.Agree(req3.ID, emp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got3, _ := svc.GetSwapRequest(req3.ID)
+	if got3.Status != SwapCompleted {
+		t.Fatalf("3-way status = %s (%s)", got3.Status, got3.FailReason)
+	}
+	for id, want := range map[string]string{
+		"a3": "bob", "b1": "alice", "a4": "carol", "c3": "alice",
+	} {
+		if sh, _ := svc.GetShift(id); sh.EmployeeID != want {
+			t.Fatalf("%s = %s, want %s", id, sh.EmployeeID, want)
+		}
+	}
+}
+
+// TestCreateSwapRequest_UnbalancedGiveTake 验证同一参与者交出与接收数量
+// 不相等的轮换在创建时即被拒绝（不构成闭环）。
+func TestCreateSwapRequest_UnbalancedGiveTake(t *testing.T) {
+	f := newFixture(t)
+	// alice 交出 s1，bob 交出 s2，但两个班次都给 carol：carol 接 2 交 1，不闭环。
+	if _, err := f.svc.CreateSwapRequest([]Rotation{
+		{"s1", "carol"}, {"s2", "carol"}, {"s3", "alice"},
+	}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("unbalanced rotation: want ErrInvalidInput, got %v", err)
+	}
+}
+
 // TestSwap_HolisticValidation_Overlap 证明生效校验针对换班后的完整排班，
 // 而非逐条原班次：逐条看两个班次都只是“换到有资质的人”，但交换后两人各自重叠。
 func TestSwap_HolisticValidation_Overlap(t *testing.T) {

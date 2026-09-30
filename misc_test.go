@@ -94,6 +94,18 @@ func TestScheduleShift_InvalidShapeAndUnknownEmployee(t *testing.T) {
 	if _, err := f.svc.ScheduleShift(Shift{ID: " "}); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("blank id: want ErrInvalidInput, got %v", err)
 	}
+	// 缺少起止时间的班次没有意义，必须拒绝。
+	if _, err := f.svc.ScheduleShift(Shift{
+		ID: "x", Position: "A", EmployeeID: "alice",
+	}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("zero time range: want ErrInvalidInput, got %v", err)
+	}
+	if _, err := f.svc.ScheduleShift(Shift{
+		ID: "x", Position: "A", EmployeeID: "alice",
+		End: dayTime(1, 16, 0),
+	}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("missing start: want ErrInvalidInput, got %v", err)
+	}
 	if _, err := f.svc.ScheduleShift(Shift{
 		ID: "x", Position: "A", EmployeeID: "alice",
 		Start: dayTime(1, 10, 0), End: dayTime(1, 9, 0),
@@ -111,6 +123,47 @@ func TestScheduleShift_InvalidShapeAndUnknownEmployee(t *testing.T) {
 		Start: dayTime(9, 8, 0), End: dayTime(9, 16, 0),
 	}); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("duplicate shift: want ErrAlreadyExists, got %v", err)
+	}
+}
+
+// TestScheduleShift_EndpointTouching 验证端点相接不算时间重叠：
+// 关闭最短休息约束时，前班结束即后班开始是合法的；
+// 默认 8h 休息约束下同一排布则因休息不足被拒。
+func TestScheduleShift_EndpointTouching(t *testing.T) {
+	svc, err := NewService(NewMemoryStore(), WithMinRest(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.RegisterEmployee("alice", "Alice", []string{"A"}); err != nil {
+		t.Fatal(err)
+	}
+	backToBack := []Shift{
+		{ID: "e1", Position: "A", EmployeeID: "alice",
+			Start: dayTime(1, 8, 0), End: dayTime(1, 16, 0)},
+		{ID: "e2", Position: "A", EmployeeID: "alice",
+			Start: dayTime(1, 16, 0), End: dayTime(1, 20, 0)},
+	}
+	for _, sh := range backToBack {
+		if _, err := svc.ScheduleShift(sh); err != nil {
+			t.Fatalf("endpoint-touching with minRest=0 should be legal: %v", err)
+		}
+	}
+
+	// 同一排布在默认 8h 休息约束下必须因休息不足被拒。
+	f := newFixture(t)
+	if _, err := f.svc.ScheduleShift(Shift{
+		ID: "tight", Position: "A", EmployeeID: "alice",
+		Start: dayTime(1, 16, 0), End: dayTime(1, 20, 0),
+	}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("back-to-back under 8h rest: want ErrInvalidInput, got %v", err)
+	}
+
+	// overlaps 单元语义：端点相接不重叠，任一方向相交则重叠。
+	if overlaps(dayTime(1, 8, 0), dayTime(1, 16, 0), dayTime(1, 16, 0), dayTime(1, 20, 0)) {
+		t.Fatal("endpoint-touching intervals must not overlap")
+	}
+	if !overlaps(dayTime(1, 8, 0), dayTime(1, 16, 0), dayTime(1, 15, 0), dayTime(1, 20, 0)) {
+		t.Fatal("intersecting intervals must overlap")
 	}
 }
 

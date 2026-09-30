@@ -768,7 +768,7 @@ func snapshotInvolves(requests map[string]*SwapRequest, employeeID, shiftID stri
 	return false
 }
 
-// ListChanges 返回所有已生效换班的最终变更明细，按申请 ID、班次 ID 排序。
+// ListChanges 返回所有已生效换班的最终变更明细，按班次 ID、新版本号排序。
 func (s *Service) ListChanges() []ShiftChange {
 	s.mu.Lock()
 	defer s.mu.Unlock()

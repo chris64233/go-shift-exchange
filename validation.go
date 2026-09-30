@@ -23,7 +23,9 @@ func validateShiftShape(s Shift) error {
 	if s.EmployeeID == "" {
 		v = append(v, "shift employee id is required")
 	}
-	if !s.Start.IsZero() && !s.End.IsZero() && !s.End.After(s.Start) {
+	if s.Start.IsZero() || s.End.IsZero() {
+		v = append(v, fmt.Sprintf("shift %q start and end are required", s.ID))
+	} else if !s.End.After(s.Start) {
 		v = append(v, fmt.Sprintf("shift %q end must be after start", s.ID))
 	}
 	return validationError(v)

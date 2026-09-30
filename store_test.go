@@ -173,6 +173,90 @@ func TestFileStore_AppendReopen(t *testing.T) {
 	}
 }
 
+// TestFileStore_ReplayPendingThenComplete 验证 pending 状态的申请（含冻结快照
+// 与已收集的同意）在重启重放后完整还原，并能继续推进直至原子生效：
+// 生效裁决必须使用重放恢复的快照做版本核对。
+func TestFileStore_ReplayPendingThenComplete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+
+	store1, err := NewFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc1, err := NewService(store1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []struct{ id string }{{"alice"}, {"carol"}} {
+		if _, err := svc1.RegisterEmployee(e.id, e.id, []string{"A"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sh := range []struct{ id, emp string }{{"s1", "alice"}, {"s3", "carol"}} {
+		day := 1
+		if sh.id == "s3" {
+			day = 3
+		}
+		if _, err := svc1.ScheduleShift(Shift{
+			ID: sh.id, Position: "A", EmployeeID: sh.emp,
+			Start: dayTime(day, 8, 0), End: dayTime(day, 16, 0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req, err := svc1.CreateSwapRequest([]Rotation{
+		{"s1", "carol"}, {"s3", "alice"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc1.Agree(req.ID, "alice"); err != nil { // 只收一票就“崩溃”
+		t.Fatal(err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重启重放：pending 申请、已收集的同意、冻结快照都必须还原。
+	store2, err := NewFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	svc2, err := NewService(store2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := svc2.GetSwapRequest(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Status != SwapPending || len(pending.Agreed) != 1 || pending.Agreed[0] != "alice" {
+		t.Fatalf("replayed pending request = %s agreed=%v", pending.Status, pending.Agreed)
+	}
+	if len(pending.Snapshots) != 2 || pending.Snapshots[0].Shift.Version != 1 {
+		t.Fatalf("replayed snapshots = %+v, want 2 frozen at v1", pending.Snapshots)
+	}
+
+	// 重放后继续推进：最后一票基于恢复快照裁决并一次性落班。
+	res, err := svc2.Agree(req.ID, "carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Request.Status != SwapCompleted {
+		t.Fatalf("status after restart = %s (%s)", res.Request.Status, res.Request.FailReason)
+	}
+	for id, want := range map[string]string{"s1": "carol", "s3": "alice"} {
+		sh, err := svc2.GetShift(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sh.EmployeeID != want || sh.Version != 2 {
+			t.Fatalf("%s = %s v%d, want %s v2", id, sh.EmployeeID, sh.Version, want)
+		}
+	}
+}
+
 // TestMemoryStore_ConcurrentAppend 并发追加下事件不丢失、Seq 唯一。
 func TestMemoryStore_ConcurrentAppend(t *testing.T) {
 	store := NewMemoryStore()
