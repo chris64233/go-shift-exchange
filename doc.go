@@ -1,10 +1,10 @@
-// Package goshiftexchange 实现多人排班场景下的原子换班申请。
+// Package goshiftexchange 实现双人排班场景下的原子双向换班申请。
 //
-// 一份换班申请（SwapRequest）可以描述两到四名员工之间的班次轮换；申请提交时
-// 冻结所涉及班次的当前版本。只有所有参与者一致同意，换班才会一次性生效：生效前
-// 会再次核对班次版本并对“换班后的完整排班”做岗位资质、时间不重叠、最短休息间隔
-// 三项校验。任何人拒绝或撤回都会立即结束申请，原排班保持不变；任何并发时序下都
-// 不可能出现只交换了部分员工的中间结果。
+// 一份换班申请固定两名员工、一条原班次、一条目标班次和提交时的排班版本。
+// 只有两名参与者分别同意，换班才会一次性生效：生效前会再次核对申请内容、班次
+// 版本和排班版本，并对“换班后的完整排班”做岗位资质、时间不重叠、最短休息间隔
+// 和岗位人数四项校验。任何人拒绝或撤回、管理员取消、排班调整都会结束或使旧申请
+// 失效；任何并发时序下都不可能出现只交换了部分员工的中间结果。
 //
 // 状态全部以追加事件的方式持久化（见 Store 与 FileStore），重放事件即可重建。
 package goshiftexchange
@@ -23,6 +23,8 @@ const (
 	SwapRejected SwapStatus = "rejected"
 	// SwapWithdrawn 表示有参与者撤回同意，申请结束，原排班不变。
 	SwapWithdrawn SwapStatus = "withdrawn"
+	// SwapCanceled 表示管理员取消申请，申请结束，原排班不变。
+	SwapCanceled SwapStatus = "cancelled"
 	// SwapFailed 表示同意虽已收齐，但生效时班次版本已变化或换班后排班不再合法，
 	// 申请结束，原排班不变。
 	SwapFailed SwapStatus = "failed"
@@ -31,7 +33,7 @@ const (
 // Terminal 报告该状态是否为终态（终态申请不再接受任何状态推进）。
 func (s SwapStatus) Terminal() bool {
 	switch s {
-	case SwapCompleted, SwapRejected, SwapWithdrawn, SwapFailed:
+	case SwapCompleted, SwapRejected, SwapWithdrawn, SwapCanceled, SwapFailed:
 		return true
 	default:
 		return false
@@ -55,6 +57,14 @@ type Shift struct {
 	EmployeeID string    `json:"employeeId"`
 	Version    int64     `json:"version"`
 	CreatedAt  time.Time `json:"createdAt"`
+}
+
+// StaffingRequirement 描述一段时间内某个岗位的最少在岗人数。
+type StaffingRequirement struct {
+	Position string    `json:"position"`
+	Start    time.Time `json:"start"`
+	End      time.Time `json:"end"`
+	MinStaff int       `json:"minStaff"`
 }
 
 // Rotation 描述申请中的一条轮换关系：把 ShiftID 指定的班次改派给 NewEmployeeID。
@@ -94,11 +104,14 @@ type SwapRequest struct {
 	Participants []string        `json:"participants"`
 	Rotations    []Rotation      `json:"rotations"`
 	Snapshots    []ShiftSnapshot `json:"snapshots"`
-	Status       SwapStatus      `json:"status"`
-	Agreed       []string        `json:"agreed"`
+	// ScheduleVersion 是申请创建时的排班版本。任何排班调整都会使旧申请失效。
+	ScheduleVersion int64      `json:"scheduleVersion"`
+	Status          SwapStatus `json:"status"`
+	Agreed          []string   `json:"agreed"`
 	// RejectedBy / WithdrawnBy 记录终结申请的参与者。
 	RejectedBy  string `json:"rejectedBy,omitempty"`
 	WithdrawnBy string `json:"withdrawnBy,omitempty"`
+	CancelledBy string `json:"cancelledBy,omitempty"`
 	// FailReason 记录同意收齐却未生效的原因。
 	FailReason string `json:"failReason,omitempty"`
 	// Finalization 在最后一次同意时一次性写入，裁决与落班结果都在其中。

@@ -25,10 +25,13 @@ type Service struct {
 	idPrefix string
 	seq      int64
 
-	minRest   time.Duration
-	employees map[string]*Employee
-	shifts    map[string]*Shift
-	requests  map[string]*SwapRequest
+	minRest               time.Duration
+	employees             map[string]*Employee
+	shifts                map[string]*Shift
+	requirements          map[string]*StaffingRequirement
+	requests              map[string]*SwapRequest
+	activeRequestForShift map[string]string
+	scheduleVersion       int64
 }
 
 // Option 配置 Service。
@@ -49,13 +52,15 @@ func NewService(store Store, opts ...Option) (*Service, error) {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	s := &Service{
-		store:     store,
-		now:       time.Now,
-		idPrefix:  hex.EncodeToString(b[:]),
-		employees: map[string]*Employee{},
-		shifts:    map[string]*Shift{},
-		requests:  map[string]*SwapRequest{},
-		minRest:   DefaultMinRest,
+		store:                 store,
+		now:                   time.Now,
+		idPrefix:              hex.EncodeToString(b[:]),
+		employees:             map[string]*Employee{},
+		shifts:                map[string]*Shift{},
+		requirements:          map[string]*StaffingRequirement{},
+		requests:              map[string]*SwapRequest{},
+		activeRequestForShift: map[string]string{},
+		minRest:               DefaultMinRest,
 	}
 	for _, o := range opts {
 		o(s)
@@ -132,6 +137,9 @@ func (s *Service) apply(ev Event) error {
 			return err
 		}
 		e := s.employees[p.EmployeeID]
+		if e == nil {
+			return fmt.Errorf("goshiftexchange: corrupt event %d: unknown employee %q", ev.Seq, p.EmployeeID)
+		}
 		exist := map[string]bool{}
 		for _, pos := range e.Positions {
 			exist[pos] = true
@@ -151,6 +159,21 @@ func (s *Service) apply(ev Event) error {
 		sh := p.Shift
 		s.shifts[sh.ID] = &sh
 
+	case evStaffingSet:
+		p, err := payloadAs[StaffingRequirementSetPayload](ev.Payload)
+		if err != nil {
+			return err
+		}
+		requirement := p.Requirement
+		s.requirements[staffingKey(requirement.Position, requirement.Start, requirement.End)] = &requirement
+
+	case evScheduleChanged:
+		p, err := payloadAs[ScheduleChangedPayload](ev.Payload)
+		if err != nil {
+			return err
+		}
+		s.scheduleVersion = p.Version
+
 	case evSwapCreated:
 		p, err := payloadAs[SwapCreatedPayload](ev.Payload)
 		if err != nil {
@@ -158,6 +181,9 @@ func (s *Service) apply(ev Event) error {
 		}
 		req := p.Request
 		s.requests[req.ID] = &req
+		for _, rotation := range req.Rotations {
+			s.activeRequestForShift[rotation.ShiftID] = req.ID
+		}
 
 	case evSwapAgreed:
 		p, err := payloadAs[SwapAgreedPayload](ev.Payload)
@@ -178,13 +204,20 @@ func (s *Service) apply(ev Event) error {
 			if f.Completed {
 				for _, ch := range f.Changes {
 					sh := s.shifts[ch.ShiftID]
+					if sh == nil {
+						return fmt.Errorf("goshiftexchange: corrupt event %d: unknown shift %q", ev.Seq, ch.ShiftID)
+					}
 					sh.EmployeeID = ch.ToEmployee
 					sh.Version = ch.NewVersion
 				}
+				s.scheduleVersion = req.ScheduleVersion + 1
 				req.Status = SwapCompleted
 			} else {
 				req.Status = SwapFailed
 				req.FailReason = f.Reason
+			}
+			for _, rotation := range req.Rotations {
+				delete(s.activeRequestForShift, rotation.ShiftID)
 			}
 			req.DecidedAt = ev.Timestamp
 		}
@@ -195,8 +228,14 @@ func (s *Service) apply(ev Event) error {
 			return err
 		}
 		req := s.requests[p.RequestID]
+		if req == nil {
+			return fmt.Errorf("goshiftexchange: corrupt event %d: unknown swap %q", ev.Seq, p.RequestID)
+		}
 		req.Status = SwapRejected
 		req.RejectedBy = p.EmployeeID
+		for _, rotation := range req.Rotations {
+			delete(s.activeRequestForShift, rotation.ShiftID)
+		}
 		req.DecidedAt = ev.Timestamp
 
 	case evSwapWithdrawn:
@@ -205,10 +244,49 @@ func (s *Service) apply(ev Event) error {
 			return err
 		}
 		req := s.requests[p.RequestID]
+		if req == nil {
+			return fmt.Errorf("goshiftexchange: corrupt event %d: unknown swap %q", ev.Seq, p.RequestID)
+		}
 		req.Status = SwapWithdrawn
 		req.WithdrawnBy = p.EmployeeID
-		// 撤回即移除该参与者此前的同意。
 		req.Agreed = removeString(req.Agreed, p.EmployeeID)
+		for _, rotation := range req.Rotations {
+			delete(s.activeRequestForShift, rotation.ShiftID)
+		}
+		req.DecidedAt = ev.Timestamp
+
+	case evSwapCanceled:
+		p, err := payloadAs[SwapCanceledPayload](ev.Payload)
+		if err != nil {
+			return err
+		}
+		req := s.requests[p.RequestID]
+		if req == nil {
+			return fmt.Errorf("goshiftexchange: corrupt event %d: unknown swap %q", ev.Seq, p.RequestID)
+		}
+		req.Status = SwapCanceled
+		req.CancelledBy = p.AdminID
+		req.FailReason = p.Reason
+		for _, rotation := range req.Rotations {
+			delete(s.activeRequestForShift, rotation.ShiftID)
+		}
+		req.DecidedAt = ev.Timestamp
+
+	case evSwapInvalidated:
+		p, err := payloadAs[SwapInvalidatedPayload](ev.Payload)
+		if err != nil {
+			return err
+		}
+		req := s.requests[p.RequestID]
+		if req == nil {
+			return fmt.Errorf("goshiftexchange: corrupt event %d: unknown swap %q", ev.Seq, p.RequestID)
+		}
+		req.Status = SwapFailed
+		req.FailReason = p.Reason
+		s.scheduleVersion = p.ScheduleVersion
+		for _, rotation := range req.Rotations {
+			delete(s.activeRequestForShift, rotation.ShiftID)
+		}
 		req.DecidedAt = ev.Timestamp
 
 	default:
@@ -334,14 +412,66 @@ func (s *Service) ScheduleShift(sh Shift) (*Shift, error) {
 		prospective[id] = &cp
 	}
 	prospective[sh.ID] = &sh
-	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest); err != nil {
+	if err := validateFullSwapSchedule(s.employeeMap(), s.requirements, prospective, s.minRest); err != nil {
 		return nil, err
 	}
-	if err := s.commit([]Event{s.emit(evShiftScheduled, ShiftScheduledPayload{Shift: sh})}); err != nil {
+	events := s.scheduleChangedEvents("schedule was adjusted by adding shift "+sh.ID, "")
+	events = append(events, s.emit(evShiftScheduled, ShiftScheduledPayload{Shift: sh}))
+	if err := s.commit(events); err != nil {
 		return nil, err
 	}
 	got := sh
 	return &got, nil
+}
+
+// SetStaffingRequirement 设置一个岗位时间段的最少在岗人数。
+func (s *Service) SetStaffingRequirement(requirement StaffingRequirement) error {
+	if strings.TrimSpace(requirement.Position) == "" {
+		return fmt.Errorf("%w: position is required", ErrInvalidInput)
+	}
+	if requirement.MinStaff <= 0 {
+		return fmt.Errorf("%w: min staff must be positive", ErrInvalidInput)
+	}
+	if !requirement.End.After(requirement.Start) {
+		return fmt.Errorf("%w: requirement end must be after start", ErrInvalidInput)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.commit([]Event{s.emit(evStaffingSet, StaffingRequirementSetPayload{Requirement: requirement})})
+}
+
+// ScheduleVersion 返回当前排班版本。
+func (s *Service) ScheduleVersion() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.scheduleVersion
+}
+
+// scheduleChangedEvents 生成使全部待确认旧申请失效的事件。
+func (s *Service) scheduleChangedEvents(reason, exceptRequestID string) []Event {
+	pending := make([]*SwapRequest, 0)
+	for _, req := range s.requests {
+		if req.Status == SwapPending {
+			pending = append(pending, req)
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].ID < pending[j].ID })
+	events := []Event{s.emit(evScheduleChanged, ScheduleChangedPayload{
+		Version: s.scheduleVersion + 1,
+		Reason:  reason,
+	})}
+	for _, req := range pending {
+		if req.ID == exceptRequestID {
+			continue
+		}
+		events = append(events, s.emit(evSwapInvalidated, SwapInvalidatedPayload{
+			RequestID:       req.ID,
+			Reason:          reason,
+			ScheduleVersion: s.scheduleVersion + 1,
+		}))
+	}
+	return events
 }
 
 // employeeMap 在持锁状态下返回员工深拷贝映射（校验器不得持有内部指针）。
@@ -386,7 +516,7 @@ func (s *Service) ListShifts() []Shift {
 // 换班申请
 // ---------------------------------------------------------------------------
 
-// CreateSwapRequest 创建一份两到四名员工之间的换班申请，并冻结涉及班次的当前版本。
+// CreateSwapRequest 创建一份两名员工之间的双向换班申请，并冻结班次与排班版本。
 //
 // 创建时即对换班后的完整排班做一次预检（返回快照时申请者能立刻看到“这样换合法”）；
 // 但预检结果不作为最终依据，最后一次同意生效时会基于最新状态重新完整复核。
@@ -405,98 +535,78 @@ func (s *Service) CreateSwapRequest(rotations []Rotation) (*SwapRequest, error) 
 	return &got, nil
 }
 
-// buildSwapRequest 在持锁状态下校验轮换关系、冻结快照并做创建时预检。
+// CreateTwoWaySwap 为两名员工当前持有的两条班次创建双向换班申请。
+func (s *Service) CreateTwoWaySwap(firstShiftID, secondShiftID string) (*SwapRequest, error) {
+	return s.CreateSwapRequest([]Rotation{{ShiftID: firstShiftID}, {ShiftID: secondShiftID}})
+}
+
+// buildSwapRequest 在持锁状态下校验双向关系、冻结快照并做创建时预检。
 func (s *Service) buildSwapRequest(rotations []Rotation) (*SwapRequest, error) {
 	var problems []string
-	if n := len(rotations); n < 2 || n > 4 {
-		problems = append(problems, fmt.Sprintf("a swap must rotate 2 to 4 shifts, got %d", n))
+	if len(rotations) != 2 {
+		problems = append(problems, fmt.Sprintf("a two-way swap needs exactly 2 shifts, got %d", len(rotations)))
 	}
 
 	shiftSet := map[string]bool{}
-	newHolders := map[string]int{}
-	holders := map[string]int{}
 	for _, r := range rotations {
-		if r.ShiftID == "" || r.NewEmployeeID == "" {
-			problems = append(problems, "each rotation needs a shift id and a new employee id")
+		if strings.TrimSpace(r.ShiftID) == "" {
+			problems = append(problems, "each shift id is required")
 			continue
 		}
 		if shiftSet[r.ShiftID] {
 			problems = append(problems, fmt.Sprintf("shift %q appears more than once", r.ShiftID))
 		}
 		shiftSet[r.ShiftID] = true
-		newHolders[r.NewEmployeeID]++
 	}
 
-	// 解析所涉及班次、冻结快照，并统计当前持有人集合。
-	snapshots := make([]ShiftSnapshot, 0, len(rotations))
+	snapshots := make([]ShiftSnapshot, 0, 2)
+	participantSet := map[string]bool{}
 	for _, r := range rotations {
-		if r.ShiftID == "" {
-			continue // 已在上面的问题列表中
+		if strings.TrimSpace(r.ShiftID) == "" {
+			continue
 		}
 		sh, ok := s.shifts[r.ShiftID]
 		if !ok {
-			// 班次不存在属于实体缺失，直接返回 NotFound 而非聚合校验错误。
 			return nil, &NotFoundError{Kind: "shift", ID: r.ShiftID}
 		}
-		if r.NewEmployeeID != "" {
-			if _, ok := s.employees[r.NewEmployeeID]; !ok {
-				problems = append(problems, fmt.Sprintf("employee %q not registered", r.NewEmployeeID))
-			}
+		if activeID, occupied := s.activeRequestForShift[sh.ID]; occupied {
+			return nil, &ConflictError{Reason: fmt.Sprintf(
+				"shift %q is already included in pending swap request %q", sh.ID, activeID)}
 		}
 		snapshots = append(snapshots, ShiftSnapshot{Shift: *sh})
-		holders[sh.EmployeeID]++
-		if sh.EmployeeID == r.NewEmployeeID {
-			problems = append(problems, fmt.Sprintf("shift %q is already held by %q", r.ShiftID, r.NewEmployeeID))
-		}
+		participantSet[sh.EmployeeID] = true
 	}
 
-	// 参与者 = 当前持有人集合，必须恰好 2~4 人。
-	participantSet := map[string]bool{}
-	for id := range holders {
-		participantSet[id] = true
-	}
-	if len(problems) == 0 {
-		if n := len(participantSet); n < 2 || n > 4 {
-			problems = append(problems, fmt.Sprintf("a swap must involve 2 to 4 distinct employees, got %d", n))
-		}
-		// 轮换必须在参与者集合内部闭环：每个参与者交出一个班次、接一个班次。
-		if len(newHolders) != len(participantSet) {
-			problems = append(problems, "rotations must form a closed cycle among the current holders")
-		}
-		for emp, n := range newHolders {
-			if !participantSet[emp] {
-				problems = append(problems, fmt.Sprintf("new holder %q is not among current holders", emp))
-			}
-			if holders[emp] != n {
-				problems = append(problems, fmt.Sprintf("employee %q would give up %d shift(s) but take %d", emp, holders[emp], n))
-			}
-		}
+	if len(problems) == 0 && len(participantSet) != 2 {
+		problems = append(problems, fmt.Sprintf("a two-way swap must involve exactly 2 distinct employees, got %d", len(participantSet)))
 	}
 	if err := validationError(problems); err != nil {
 		return nil, err
 	}
 
-	participants := make([]string, 0, len(participantSet))
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].Shift.ID < snapshots[j].Shift.ID })
+	participants := make([]string, 0, 2)
 	for id := range participantSet {
 		participants = append(participants, id)
 	}
 	sort.Strings(participants)
-	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].Shift.ID < snapshots[j].Shift.ID })
-	rots := append([]Rotation(nil), rotations...)
-	sort.Slice(rots, func(i, j int) bool { return rots[i].ShiftID < rots[j].ShiftID })
-
-	req := &SwapRequest{
-		ID:           s.newID("swap"),
-		Participants: participants,
-		Rotations:    rots,
-		Snapshots:    snapshots,
-		Status:       SwapPending,
-		CreatedAt:    s.now(),
+	rots := []Rotation{
+		{ShiftID: snapshots[0].Shift.ID, NewEmployeeID: snapshots[1].Shift.EmployeeID},
+		{ShiftID: snapshots[1].Shift.ID, NewEmployeeID: snapshots[0].Shift.EmployeeID},
 	}
 
-	// 创建时预检：对“换班后的完整排班”做三项校验，而不是逐条检查原班次。
+	req := &SwapRequest{
+		ID:              s.newID("swap"),
+		Participants:    participants,
+		Rotations:       rots,
+		Snapshots:       snapshots,
+		ScheduleVersion: s.scheduleVersion,
+		Status:          SwapPending,
+		CreatedAt:       s.now(),
+	}
+
 	prospective, _ := buildProspectiveSchedule(s.shifts, rots)
-	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest); err != nil {
+	if err := validateFullSwapSchedule(s.employeeMap(), s.requirements, prospective, s.minRest); err != nil {
 		return nil, err
 	}
 	return req, nil
@@ -552,6 +662,18 @@ func (s *Service) Agree(requestID, employeeID string) (*ActionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	req, ok := s.requests[requestID]
+	if !ok {
+		return nil, &NotFoundError{Kind: "swap request", ID: requestID}
+	}
+	if req.Status.Terminal() && contains(req.Agreed, employeeID) {
+		return &ActionResult{Request: req.Clone(), Idempotent: true}, nil
+	}
+	if req.Status.Terminal() {
+		return nil, &ConflictError{RequestID: requestID, Reason: fmt.Sprintf(
+			"request already reached final status %s (current schedule version v%d)",
+			req.Status, s.scheduleVersion)}
+	}
 	req, err := s.lockPendingParticipant(requestID, employeeID)
 	if err != nil {
 		return nil, err
@@ -565,7 +687,11 @@ func (s *Service) Agree(requestID, employeeID string) (*ActionResult, error) {
 		fin = s.finalize(req)
 	}
 	payload := SwapAgreedPayload{RequestID: requestID, EmployeeID: employeeID, Finalization: fin}
-	if err := s.commit([]Event{s.emit(evSwapAgreed, payload)}); err != nil {
+	events := []Event{s.emit(evSwapAgreed, payload)}
+	if fin != nil && fin.Completed {
+		events = append(events, s.scheduleChangedEvents("schedule was adjusted by a completed swap", requestID)...)
+	}
+	if err := s.commit(events); err != nil {
 		return nil, err
 	}
 	return &ActionResult{Request: s.requests[requestID].Clone()}, nil
@@ -597,23 +723,28 @@ func (s *Service) finalize(req *SwapRequest) *Finalization {
 	for _, r := range req.Rotations {
 		live, ok := s.shifts[r.ShiftID]
 		if !ok {
-			return &Finalization{Completed: false, Reason: fmt.Sprintf("shift %q no longer exists", r.ShiftID)}
+			return s.failFinalization(req, fmt.Sprintf("shift %q no longer exists", r.ShiftID))
 		}
 		old := frozen[r.ShiftID]
 		if live.Version != old.Version {
-			return &Finalization{Completed: false, Reason: fmt.Sprintf(
-				"shift %q version conflict: frozen at v%d, now v%d", r.ShiftID, old.Version, live.Version)}
+			return s.failFinalization(req, fmt.Sprintf(
+				"shift %q content changed: frozen at v%d, now v%d", r.ShiftID, old.Version, live.Version))
 		}
 		if live.EmployeeID != old.EmployeeID {
-			return &Finalization{Completed: false, Reason: fmt.Sprintf(
-				"shift %q holder changed: frozen %q, now %q", r.ShiftID, old.EmployeeID, live.EmployeeID)}
+			return s.failFinalization(req, fmt.Sprintf(
+				"shift %q content changed: frozen holder %q, now %q", r.ShiftID, old.EmployeeID, live.EmployeeID))
 		}
+	}
+	if s.scheduleVersion != req.ScheduleVersion {
+		return s.failFinalization(req, fmt.Sprintf(
+			"schedule version conflict: request frozen at v%d, current version is v%d",
+			req.ScheduleVersion, s.scheduleVersion))
 	}
 
 	// 2) 构造换班后的完整排班并整体复核（不是逐条校验原班次）。
 	prospective, currentHolder := buildProspectiveSchedule(s.shifts, req.Rotations)
-	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest); err != nil {
-		return &Finalization{Completed: false, Reason: err.Error()}
+	if err := validateFullSwapSchedule(s.employeeMap(), s.requirements, prospective, s.minRest); err != nil {
+		return s.failFinalization(req, err.Error())
 	}
 
 	// 3) 全部通过：一次性产出所有改派明细（真正落班由 apply 在同一事件中完成）。
@@ -631,6 +762,13 @@ func (s *Service) finalize(req *SwapRequest) *Finalization {
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].ShiftID < changes[j].ShiftID })
 	return &Finalization{Completed: true, Changes: changes}
+}
+
+func (s *Service) failFinalization(req *SwapRequest, reason string) *Finalization {
+	for _, rotation := range req.Rotations {
+		delete(s.activeRequestForShift, rotation.ShiftID)
+	}
+	return &Finalization{Completed: false, Reason: reason}
 }
 
 // Reject 由参与者拒绝申请；申请立即终结为 rejected，原排班保持不变。
@@ -685,6 +823,35 @@ func (s *Service) Withdraw(requestID, employeeID string) (*ActionResult, error) 
 	}
 	if err := s.commit([]Event{s.emit(evSwapWithdrawn, SwapWithdrawnPayload{
 		RequestID: requestID, EmployeeID: employeeID,
+	})}); err != nil {
+		return nil, err
+	}
+	return &ActionResult{Request: s.requests[requestID].Clone()}, nil
+}
+
+// CancelSwapRequest 由管理员取消待确认申请；取消不改变任何班次。
+func (s *Service) CancelSwapRequest(requestID, adminID, reason string) (*ActionResult, error) {
+	if strings.TrimSpace(adminID) == "" {
+		return nil, fmt.Errorf("%w: admin id is required", ErrInvalidInput)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	req, ok := s.requests[requestID]
+	if !ok {
+		return nil, &NotFoundError{Kind: "swap request", ID: requestID}
+	}
+	if req.Status == SwapCanceled {
+		return &ActionResult{Request: req.Clone(), Idempotent: true}, nil
+	}
+	if req.Status.Terminal() {
+		return nil, &ConflictError{RequestID: requestID, Reason: fmt.Sprintf(
+			"request already reached final status %s", req.Status)}
+	}
+	if err := s.commit([]Event{s.emit(evSwapCanceled, SwapCanceledPayload{
+		RequestID: requestID,
+		AdminID:   adminID,
+		Reason:    reason,
 	})}); err != nil {
 		return nil, err
 	}

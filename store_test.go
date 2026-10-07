@@ -77,8 +77,8 @@ func TestFileStore_PersistsAndReplays(t *testing.T) {
 		lineCount++
 	}
 	f.Close()
-	if lineCount != 7 { // 2 员工 + 2 班次 + 1 创建 + 2 同意
-		t.Fatalf("event lines = %d, want 7", lineCount)
+	if lineCount != 10 { // 2 员工 + 2 个排班版本事件 + 2 班次 + 1 创建 + 2 同意
+		t.Fatalf("event lines = %d, want 10", lineCount)
 	}
 
 	// 用全新的 Service 重放同一文件，状态必须一致。

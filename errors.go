@@ -15,6 +15,8 @@ var (
 	ErrInvalidInput = errors.New("goshiftexchange: invalid input")
 	// ErrNotParticipant 表示操作者不是该申请的参与者。
 	ErrNotParticipant = errors.New("goshiftexchange: employee is not a participant")
+	// ErrConflict 表示并发版本变化、申请内容失效或班次已被其他申请占用。
+	ErrConflict = errors.New("goshiftexchange: conflict")
 )
 
 // NotFoundError 携带实体类别与 ID，Unwrap 到 ErrNotFound。
@@ -61,3 +63,18 @@ type TerminalStateError struct {
 func (e *TerminalStateError) Error() string {
 	return fmt.Sprintf("goshiftexchange: swap request %q is already %s", e.RequestID, e.Status)
 }
+
+// ConflictError 携带可展示给调用方的并发或占用冲突原因。
+type ConflictError struct {
+	RequestID string
+	Reason    string
+}
+
+func (e *ConflictError) Error() string {
+	if e.RequestID == "" {
+		return "goshiftexchange: conflict: " + e.Reason
+	}
+	return fmt.Sprintf("goshiftexchange: swap request %q conflict: %s", e.RequestID, e.Reason)
+}
+
+func (e *ConflictError) Unwrap() error { return ErrConflict }

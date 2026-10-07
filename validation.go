@@ -94,6 +94,42 @@ func validateEmployeeSchedule(
 	return validationError(violations)
 }
 
+// validateStaffingRequirements 校验换班后的岗位人数。
+func validateStaffingRequirements(
+	requirements map[string]*StaffingRequirement,
+	shifts map[string]*Shift,
+) error {
+	var violations []string
+	for _, requirement := range requirements {
+		count := 0
+		for _, sh := range shifts {
+			if sh.Position == requirement.Position &&
+				overlaps(requirement.Start, requirement.End, sh.Start, sh.End) {
+				count++
+			}
+		}
+		if count < requirement.MinStaff {
+			violations = append(violations, fmt.Sprintf(
+				"position %q needs %d staff member(s) between %s and %s, post-swap schedule has %d",
+				requirement.Position, requirement.MinStaff,
+				requirement.Start.Format(time.RFC3339), requirement.End.Format(time.RFC3339), count))
+		}
+	}
+	return validationError(violations)
+}
+
+func validateFullSwapSchedule(
+	employees map[string]Employee,
+	requirements map[string]*StaffingRequirement,
+	shifts map[string]*Shift,
+	minRest time.Duration,
+) error {
+	if err := validateEmployeeSchedule(employees, shifts, minRest); err != nil {
+		return err
+	}
+	return validateStaffingRequirements(requirements, shifts)
+}
+
 // buildProspectiveSchedule 以当前 live 班次为基础，套用申请中的轮换关系，
 // 返回换班生效后的完整班次副本。它只负责构造，不做任何合法性判断。
 //
@@ -115,4 +151,8 @@ func buildProspectiveSchedule(
 		}
 	}
 	return prospective, currentHolder
+}
+
+func staffingKey(position string, start, end time.Time) string {
+	return position + "|" + start.Format(time.RFC3339Nano) + "|" + end.Format(time.RFC3339Nano)
 }

@@ -3,6 +3,7 @@ package goshiftexchange
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -250,60 +251,16 @@ func TestSwap_TwoPeople_AppliesAtomically(t *testing.T) {
 	}
 }
 
-func TestSwap_ThreeAndFourPeople(t *testing.T) {
+func TestSwap_RequiresExactlyTwoEmployeesAndTwoShifts(t *testing.T) {
 	f := newFixture(t)
-	// 全员补 A/B 资质以便跨岗位轮换。
-	for _, emp := range []string{"alice", "bob"} {
-		if err := f.svc.AddQualification(emp, "A", "B"); err != nil {
-			t.Fatal(err)
-		}
+	cases := [][]Rotation{
+		{{ShiftID: "s1"}},
+		{{ShiftID: "s1"}, {ShiftID: "s2"}, {ShiftID: "s3"}},
+		{{ShiftID: "s1"}, {ShiftID: "s1"}},
 	}
-
-	// 三人轮换：s1(alice)->bob, s2(bob)->carol, s3(carol)->alice
-	req3, err := f.svc.CreateSwapRequest([]Rotation{
-		{"s1", "bob"}, {"s2", "carol"}, {"s3", "alice"},
-	})
-	if err != nil {
-		t.Fatalf("3-way create: %v", err)
-	}
-	f.agreeAll(t, req3.ID, "alice", "bob", "carol")
-	got, _ := f.svc.GetSwapRequest(req3.ID)
-	if got.Status != SwapCompleted {
-		t.Fatalf("3-way status = %s (%s)", got.Status, got.FailReason)
-	}
-	for _, want := range []struct {
-		id, holder string
-	}{
-		{"s1", "bob"}, {"s2", "carol"}, {"s3", "alice"},
-	} {
-		if h, v := f.holder(t, want.id); h != want.holder || v != 2 {
-			t.Fatalf("%s = %s v%d, want %s v2", want.id, h, v, want.holder)
-		}
-	}
-
-	// 四人轮换：当前持有人 s1=bob s2=carol s3=alice s4=dave。
-	req4, err := f.svc.CreateSwapRequest([]Rotation{
-		{"s1", "carol"}, {"s2", "alice"}, {"s3", "dave"}, {"s4", "bob"},
-	})
-	if err != nil {
-		t.Fatalf("4-way create: %v", err)
-	}
-	if len(req4.Participants) != 4 {
-		t.Fatalf("participants = %v, want 4", req4.Participants)
-	}
-	f.agreeAll(t, req4.ID, "bob", "carol", "alice", "dave")
-	got, _ = f.svc.GetSwapRequest(req4.ID)
-	if got.Status != SwapCompleted {
-		t.Fatalf("4-way status = %s (%s)", got.Status, got.FailReason)
-	}
-	for _, want := range []struct {
-		id, holder string
-		version    int64
-	}{
-		{"s1", "carol", 3}, {"s2", "alice", 3}, {"s3", "dave", 3}, {"s4", "bob", 2},
-	} {
-		if h, v := f.holder(t, want.id); h != want.holder || v != want.version {
-			t.Fatalf("%s = %s v%d, want %s v%d", want.id, h, v, want.holder, want.version)
+	for _, rotations := range cases {
+		if _, err := f.svc.CreateSwapRequest(rotations); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("rotations %+v: want ErrInvalidInput, got %v", rotations, err)
 		}
 	}
 }
@@ -410,12 +367,12 @@ func TestReject_EndsRequestAndKeepsSchedule(t *testing.T) {
 		t.Fatalf("s3 changed after reject: %s", h)
 	}
 
-	// 终态后任何推进都被拒绝。
-	if _, err := f.svc.Agree(req.ID, "carol"); err == nil {
-		t.Fatal("agree after reject should fail")
+	// 拒绝者之后迟到确认，得到当前终态冲突，而不是新裁决。
+	if _, err := f.svc.Agree(req.ID, "carol"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("late agree after reject: want ErrConflict, got %v", err)
 	}
 	if _, err := f.svc.Reject(req.ID, "alice"); err == nil {
-		t.Fatal("reject after reject should fail")
+		t.Fatal("reject from a different participant after terminal should fail")
 	}
 }
 
@@ -505,10 +462,11 @@ func TestAgree_DuplicateIsIdempotent(t *testing.T) {
 		t.Fatalf("agreed = %v, want exactly 1 entry", second.Request.Agreed)
 	}
 
-	// 收齐完成后再重复同意：终态错误（申请已结束），同样不会重复落班。
+	// 收齐完成后再重复同意：返回原完成结果，同样不会重复落班。
 	f.agreeAll(t, req.ID, "carol")
-	if _, err := f.svc.Agree(req.ID, "alice"); err == nil {
-		t.Fatal("agree on completed request should fail")
+	repeat, err := f.svc.Agree(req.ID, "alice")
+	if err != nil || !repeat.Idempotent || repeat.Request.Status != SwapCompleted {
+		t.Fatalf("repeat completed agree = %+v, %v", repeat, err)
 	}
 	if h, v := f.holder(t, "s1"); h != "carol" || v != 2 {
 		t.Fatalf("s1 = %s v%d, repeated agree must not re-bump version", h, v)
@@ -532,6 +490,16 @@ func TestAgree_VersionConflictFailsAtomically(t *testing.T) {
 	if _, err := f.svc.Agree(oldReq.ID, "alice"); err != nil { // 只等 carol
 		t.Fatal(err)
 	}
+	if _, err := f.svc.ScheduleShift(Shift{
+		ID: "extra", Position: "A", EmployeeID: "dave",
+		Start: dayTime(8, 8, 0), End: dayTime(8, 16, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invalidated, _ := f.svc.GetSwapRequest(oldReq.ID)
+	if invalidated.Status != SwapFailed || !strings.Contains(invalidated.FailReason, "schedule was adjusted") {
+		t.Fatalf("old request after schedule change = %+v", invalidated)
+	}
 
 	// 另一份申请先行完成，使 s1、s3 版本变化。
 	newReq, err := f.svc.CreateSwapRequest([]Rotation{
@@ -549,16 +517,10 @@ func TestAgree_VersionConflictFailsAtomically(t *testing.T) {
 		t.Fatalf("s1 precondition = %s v%d", h, v)
 	}
 
-	// 旧申请收齐最后同意：必须因版本/持有人不一致失败，且不得覆盖新排班。
+	// 迟到确认必须返回当前版本冲突，且不得覆盖新排班。
 	res, err := f.svc.Agree(oldReq.ID, "carol")
-	if err != nil {
-		t.Fatalf("Agree: %v", err)
-	}
-	if res.Request.Status != SwapFailed {
-		t.Fatalf("old request status = %s, want failed", res.Request.Status)
-	}
-	if res.Request.FailReason == "" || res.Request.Finalization == nil || res.Request.Finalization.Completed {
-		t.Fatalf("expected failed finalization with reason, got %+v", res.Request.Finalization)
+	if !errors.As(err, new(*ConflictError)) || res != nil {
+		t.Fatalf("late agree = %+v, %v; want conflict", res, err)
 	}
 	if h, v := f.holder(t, "s1"); h != "carol" || v != 2 {
 		t.Fatalf("s1 = %s v%d, newer schedule must not be overwritten", h, v)
@@ -567,9 +529,9 @@ func TestAgree_VersionConflictFailsAtomically(t *testing.T) {
 		t.Fatalf("s3 = %s v%d, newer schedule must not be overwritten", h, v)
 	}
 
-	// 失败是终态。
-	if _, err := f.svc.Agree(oldReq.ID, "alice"); err == nil {
-		t.Fatal("agree after failed should error")
+	repeat, err := f.svc.Agree(oldReq.ID, "alice")
+	if err != nil || !repeat.Idempotent || repeat.Request.Status != SwapFailed {
+		t.Fatalf("repeat prior confirmation = %+v, %v", repeat, err)
 	}
 }
 
@@ -617,12 +579,12 @@ func TestAgree_PostSwapInvalidation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("schedule late: %v", err)
 	}
-	res, err := svc.Agree(req.ID, "carol")
-	if err != nil {
-		t.Fatalf("Agree: %v", err)
+	if _, err := svc.Agree(req.ID, "carol"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("late agree after schedule adjustment: want ErrConflict, got %v", err)
 	}
-	if res.Request.Status != SwapFailed {
-		t.Fatalf("status = %s, want failed due to post-swap overlap", res.Request.Status)
+	got, _ := svc.GetSwapRequest(req.ID)
+	if got.Status != SwapFailed {
+		t.Fatalf("status = %s, want failed due to current version conflict", got.Status)
 	}
 	if sh, _ := holderOf(t, svc, "s1"); sh != "alice" {
 		t.Fatalf("s1 = %s, schedule must stay unchanged", sh)
@@ -704,26 +666,17 @@ func TestConcurrent_LastAgreeVsWithdraw(t *testing.T) {
 	}
 }
 
-func TestConcurrent_LastAgreeVsReject_FourWay(t *testing.T) {
-	// 4 人环 + 多次重复，放大竞争窗口，验证任何时序下要么整环生效、要么排班原样。
+func TestConcurrent_LastAgreeVsReject_TwoWay(t *testing.T) {
 	for iter := 0; iter < 200; iter++ {
 		f := newFixture(t)
-		for _, emp := range []string{"alice", "bob"} {
-			if err := f.svc.AddQualification(emp, "A", "B"); err != nil {
-				t.Fatal(err)
-			}
-		}
 		req, err := f.svc.CreateSwapRequest([]Rotation{
-			{"s1", "bob"}, {"s2", "carol"}, {"s3", "dave"}, {"s4", "alice"},
+			{ShiftID: "s1"}, {ShiftID: "s3"},
 		})
 		if err != nil {
 			t.Fatalf("iter %d create: %v", iter, err)
 		}
-		// 先收三票，dave 的最后同意与 bob 的拒绝并发。
-		for _, emp := range []string{"alice", "carol", "bob"} {
-			if _, err := f.svc.Agree(req.ID, emp); err != nil {
-				t.Fatalf("iter %d agree %s: %v", iter, emp, err)
-			}
+		if _, err := f.svc.Agree(req.ID, "alice"); err != nil {
+			t.Fatalf("iter %d agree alice: %v", iter, err)
 		}
 		start := make(chan struct{})
 		var wg sync.WaitGroup
@@ -732,12 +685,12 @@ func TestConcurrent_LastAgreeVsReject_FourWay(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, errAgree = f.svc.Agree(req.ID, "dave")
+			_, errAgree = f.svc.Agree(req.ID, "carol")
 		}()
 		go func() {
 			defer wg.Done()
 			<-start
-			_, errReject = f.svc.Reject(req.ID, "bob")
+			_, errReject = f.svc.Reject(req.ID, "alice")
 		}()
 		close(start)
 		wg.Wait()
@@ -748,7 +701,7 @@ func TestConcurrent_LastAgreeVsReject_FourWay(t *testing.T) {
 			if errReject == nil {
 				t.Fatalf("iter %d: completed but reject succeeded", iter)
 			}
-			want := map[string]string{"s1": "bob", "s2": "carol", "s3": "dave", "s4": "alice"}
+			want := map[string]string{"s1": "carol", "s3": "alice"}
 			for id, holder := range want {
 				if h, v := f.holder(t, id); h != holder || v != 2 {
 					t.Fatalf("iter %d: completed but %s = %s v%d, want %s v2", iter, id, h, v, holder)
@@ -758,7 +711,7 @@ func TestConcurrent_LastAgreeVsReject_FourWay(t *testing.T) {
 			if errAgree == nil {
 				t.Fatalf("iter %d: rejected but agree succeeded", iter)
 			}
-			want := map[string]string{"s1": "alice", "s2": "bob", "s3": "carol", "s4": "dave"}
+			want := map[string]string{"s1": "alice", "s3": "carol"}
 			for id, holder := range want {
 				if h, v := f.holder(t, id); h != holder || v != 1 {
 					t.Fatalf("iter %d: rejected but %s = %s v%d (partial swap!)", iter, id, h, v)
