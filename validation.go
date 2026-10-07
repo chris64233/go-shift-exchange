@@ -36,10 +36,12 @@ func validateShiftShape(s Shift) error {
 //   - 岗位资质：员工必须持有每个所排班次岗位的资质；
 //   - 时间不重叠：同一员工任意两个班次不得时间重叠；
 //   - 最短休息间隔：同一员工相邻班次之间必须至少有 minRest 的间隔。
+//   - 岗位人数：staffing 中配置的岗位至少由指定数量的不同员工承担班次。
 func validateEmployeeSchedule(
 	employees map[string]Employee,
 	shifts map[string]*Shift,
 	minRest time.Duration,
+	staffing map[string]int,
 ) error {
 	byEmployee := make(map[string][]*Shift)
 	for _, sh := range shifts {
@@ -88,6 +90,31 @@ func validateEmployeeSchedule(
 				violations = append(violations, fmt.Sprintf(
 					"employee %q rest between shifts %q and %q is %s, less than minimum %s",
 					empID, prev.ID, sh.ID, gap, minRest))
+			}
+		}
+	}
+
+	// 岗位人数：统计每个受限岗位当前由多少名不同员工承担。
+	if len(staffing) > 0 {
+		holdersByPosition := make(map[string]map[string]bool, len(staffing))
+		for pos := range staffing {
+			holdersByPosition[pos] = map[string]bool{}
+		}
+		for _, sh := range shifts {
+			if set, ok := holdersByPosition[sh.Position]; ok {
+				set[sh.EmployeeID] = true
+			}
+		}
+		positions := make([]string, 0, len(staffing))
+		for pos := range staffing {
+			positions = append(positions, pos)
+		}
+		sort.Strings(positions)
+		for _, pos := range positions {
+			if got, want := len(holdersByPosition[pos]), staffing[pos]; got < want {
+				violations = append(violations, fmt.Sprintf(
+					"position %q is staffed by %d employee(s), less than required minimum %d",
+					pos, got, want))
 			}
 		}
 	}

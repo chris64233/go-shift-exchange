@@ -13,6 +13,7 @@ const (
 	evSwapAgreed    = "swap_agreed"
 	evSwapRejected  = "swap_rejected"
 	evSwapWithdrawn = "swap_withdrawn"
+	evSwapCancelled = "swap_cancelled"
 )
 
 // EmployeeRegisteredPayload 员工登记。
@@ -53,6 +54,12 @@ type SwapRejectedPayload struct {
 type SwapWithdrawnPayload struct {
 	RequestID  string `json:"requestId"`
 	EmployeeID string `json:"employeeId"`
+}
+
+// SwapCancelledPayload 管理员取消并终结申请。
+type SwapCancelledPayload struct {
+	RequestID string `json:"requestId"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // Event 是持久化的最小单元。

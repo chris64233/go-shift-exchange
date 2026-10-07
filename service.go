@@ -26,6 +26,7 @@ type Service struct {
 	seq      int64
 
 	minRest   time.Duration
+	staffing  map[string]int
 	employees map[string]*Employee
 	shifts    map[string]*Shift
 	requests  map[string]*SwapRequest
@@ -44,6 +45,13 @@ func WithMinRest(d time.Duration) Option {
 	return func(s *Service) { s.minRest = d }
 }
 
+// WithMinStaffing 要求某个岗位在任意时刻至少由 min 名不同员工承担班次。
+// 该约束与资质、休息间隔一样，在排班、申请预检与生效裁决时整体校验：
+// 换班若会使某岗位的承担人数跌破下限，则整个换班不生效。
+func WithMinStaffing(position string, min int) Option {
+	return func(s *Service) { s.staffing[position] = min }
+}
+
 // NewService 从 Store 重放全部历史事件构造服务。
 func NewService(store Store, opts ...Option) (*Service, error) {
 	var b [4]byte
@@ -56,6 +64,7 @@ func NewService(store Store, opts ...Option) (*Service, error) {
 		shifts:    map[string]*Shift{},
 		requests:  map[string]*SwapRequest{},
 		minRest:   DefaultMinRest,
+		staffing:  map[string]int{},
 	}
 	for _, o := range opts {
 		o(s)
@@ -211,6 +220,16 @@ func (s *Service) apply(ev Event) error {
 		req.Agreed = removeString(req.Agreed, p.EmployeeID)
 		req.DecidedAt = ev.Timestamp
 
+	case evSwapCancelled:
+		p, err := payloadAs[SwapCancelledPayload](ev.Payload)
+		if err != nil {
+			return err
+		}
+		req := s.requests[p.RequestID]
+		req.Status = SwapCancelled
+		req.CancelReason = p.Reason
+		req.DecidedAt = ev.Timestamp
+
 	default:
 		return fmt.Errorf("goshiftexchange: unknown event type %q", ev.Type)
 	}
@@ -334,7 +353,9 @@ func (s *Service) ScheduleShift(sh Shift) (*Shift, error) {
 		prospective[id] = &cp
 	}
 	prospective[sh.ID] = &sh
-	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest); err != nil {
+	// 排班是逐步构建的，岗位人数下限只在换班预检与生效裁决时校验，
+	// 这里只校验员工个人维度（资质、重叠、休息间隔）。
+	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest, nil); err != nil {
 		return nil, err
 	}
 	if err := s.commit([]Event{s.emit(evShiftScheduled, ShiftScheduledPayload{Shift: sh})}); err != nil {
@@ -496,7 +517,7 @@ func (s *Service) buildSwapRequest(rotations []Rotation) (*SwapRequest, error) {
 
 	// 创建时预检：对“换班后的完整排班”做三项校验，而不是逐条检查原班次。
 	prospective, _ := buildProspectiveSchedule(s.shifts, rots)
-	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest); err != nil {
+	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest, s.staffing); err != nil {
 		return nil, err
 	}
 	return req, nil
@@ -552,6 +573,12 @@ func (s *Service) Agree(requestID, employeeID string) (*ActionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 同一申请重复确认返回原结果：申请已完成且该员工此前已同意时，
+	// 直接返回当前（已完成）状态，不报终态错误、不重复落班。
+	if req, ok := s.requests[requestID]; ok &&
+		req.Status == SwapCompleted && contains(req.Agreed, employeeID) {
+		return &ActionResult{Request: req.Clone(), Idempotent: true}, nil
+	}
 	req, err := s.lockPendingParticipant(requestID, employeeID)
 	if err != nil {
 		return nil, err
@@ -612,7 +639,7 @@ func (s *Service) finalize(req *SwapRequest) *Finalization {
 
 	// 2) 构造换班后的完整排班并整体复核（不是逐条校验原班次）。
 	prospective, currentHolder := buildProspectiveSchedule(s.shifts, req.Rotations)
-	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest); err != nil {
+	if err := validateEmployeeSchedule(s.employeeMap(), prospective, s.minRest, s.staffing); err != nil {
 		return &Finalization{Completed: false, Reason: err.Error()}
 	}
 
@@ -685,6 +712,32 @@ func (s *Service) Withdraw(requestID, employeeID string) (*ActionResult, error) 
 	}
 	if err := s.commit([]Event{s.emit(evSwapWithdrawn, SwapWithdrawnPayload{
 		RequestID: requestID, EmployeeID: employeeID,
+	})}); err != nil {
+		return nil, err
+	}
+	return &ActionResult{Request: s.requests[requestID].Clone()}, nil
+}
+
+// Cancel 由管理员取消一份待决申请；申请立即终结为 cancelled，原排班不变。
+// 取消不需要参与者身份。与最后一次同意并发时只会有一个结果：
+// 要么换班已一次性生效（取消得到终态错误），要么申请被取消（迟到的同意
+// 得到终态错误）。重复取消返回 Idempotent=true。
+func (s *Service) Cancel(requestID, reason string) (*ActionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	req, ok := s.requests[requestID]
+	if !ok {
+		return nil, &NotFoundError{Kind: "swap request", ID: requestID}
+	}
+	if req.Status == SwapCancelled {
+		return &ActionResult{Request: req.Clone(), Idempotent: true}, nil
+	}
+	if req.Status.Terminal() {
+		return nil, &TerminalStateError{RequestID: requestID, Status: req.Status}
+	}
+	if err := s.commit([]Event{s.emit(evSwapCancelled, SwapCancelledPayload{
+		RequestID: requestID, Reason: reason,
 	})}); err != nil {
 		return nil, err
 	}

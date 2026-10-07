@@ -2,9 +2,9 @@
 //
 // 一份换班申请（SwapRequest）可以描述两到四名员工之间的班次轮换；申请提交时
 // 冻结所涉及班次的当前版本。只有所有参与者一致同意，换班才会一次性生效：生效前
-// 会再次核对班次版本并对“换班后的完整排班”做岗位资质、时间不重叠、最短休息间隔
-// 三项校验。任何人拒绝或撤回都会立即结束申请，原排班保持不变；任何并发时序下都
-// 不可能出现只交换了部分员工的中间结果。
+// 会再次核对班次版本并对“换班后的完整排班”做岗位资质、时间不重叠、最短休息间隔、
+// 岗位人数（WithMinStaffing）四项校验。任何人拒绝、撤回或管理员取消都会立即结束
+// 申请，原排班保持不变；任何并发时序下都不可能出现只交换了部分员工的中间结果。
 //
 // 状态全部以追加事件的方式持久化（见 Store 与 FileStore），重放事件即可重建。
 package goshiftexchange
@@ -26,12 +26,14 @@ const (
 	// SwapFailed 表示同意虽已收齐，但生效时班次版本已变化或换班后排班不再合法，
 	// 申请结束，原排班不变。
 	SwapFailed SwapStatus = "failed"
+	// SwapCancelled 表示管理员取消，申请结束，原排班不变。
+	SwapCancelled SwapStatus = "cancelled"
 )
 
 // Terminal 报告该状态是否为终态（终态申请不再接受任何状态推进）。
 func (s SwapStatus) Terminal() bool {
 	switch s {
-	case SwapCompleted, SwapRejected, SwapWithdrawn, SwapFailed:
+	case SwapCompleted, SwapRejected, SwapWithdrawn, SwapFailed, SwapCancelled:
 		return true
 	default:
 		return false
@@ -99,6 +101,8 @@ type SwapRequest struct {
 	// RejectedBy / WithdrawnBy 记录终结申请的参与者。
 	RejectedBy  string `json:"rejectedBy,omitempty"`
 	WithdrawnBy string `json:"withdrawnBy,omitempty"`
+	// CancelReason 记录管理员取消时给出的原因。
+	CancelReason string `json:"cancelReason,omitempty"`
 	// FailReason 记录同意收齐却未生效的原因。
 	FailReason string `json:"failReason,omitempty"`
 	// Finalization 在最后一次同意时一次性写入，裁决与落班结果都在其中。

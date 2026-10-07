@@ -505,10 +505,14 @@ func TestAgree_DuplicateIsIdempotent(t *testing.T) {
 		t.Fatalf("agreed = %v, want exactly 1 entry", second.Request.Agreed)
 	}
 
-	// 收齐完成后再重复同意：终态错误（申请已结束），同样不会重复落班。
+	// 收齐完成后再重复确认：返回原结果（幂等），不会重复落班。
 	f.agreeAll(t, req.ID, "carol")
-	if _, err := f.svc.Agree(req.ID, "alice"); err == nil {
-		t.Fatal("agree on completed request should fail")
+	again, err := f.svc.Agree(req.ID, "alice")
+	if err != nil {
+		t.Fatalf("repeat confirm on completed request should return original result: %v", err)
+	}
+	if !again.Idempotent || again.Request.Status != SwapCompleted {
+		t.Fatalf("repeat confirm = %+v, want idempotent completed result", again)
 	}
 	if h, v := f.holder(t, "s1"); h != "carol" || v != 2 {
 		t.Fatalf("s1 = %s v%d, repeated agree must not re-bump version", h, v)
